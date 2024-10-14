@@ -6,7 +6,7 @@
   "scripts": {
     "build": "tsc",
     "start": "npm run build && node dist/index.js",
-    "dev": "nodemon --watch \"src/**/*\" --exec tsx src/index.ts",
+    "dev": "nodemon --watch \"src/**/*\" --exec npm run start src/index.ts",
     "lint": "eslint src/**/*.ts --fix"
   },
   "author": "",

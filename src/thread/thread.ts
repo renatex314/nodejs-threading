@@ -1,6 +1,6 @@
+import path from "path";
 import { Worker } from "worker_threads";
 import { extractFunctionData, JSONCompatible } from "./utils";
-import { isTypedArray } from "util/types";
 
 export type ThreadMessage<T> = string | number | Uint32Array | JSONCompatible<T> | object;
 
@@ -10,7 +10,8 @@ export type ThreadMessage<T> = string | number | Uint32Array | JSONCompatible<T>
 export type ThreadFunction<T> = (
   notify: (message: ThreadMessage<T>) => void, 
   next: () => Promise<ThreadMessage<T>>, 
-  terminate: () => void
+  terminate: () => void,
+  importModule: <T = unknown>(relativePath: string) => T
 ) => void;
 
 export type OnMessageCallback<T> = (message: ThreadMessage<T>) => void;
@@ -30,6 +31,7 @@ export default class Thread<T> {
   private onMessageCallback: OnMessageCallback<T> | null;
   private onErrorCallback: OnErrorCallback | null;
   private onExitCallback: OnExitCallback | null;
+  private instatiationDirname: string;
 
   constructor(fn: ThreadFunction<T>) {
     this.threadFunction = fn;
@@ -37,6 +39,30 @@ export default class Thread<T> {
     this.onMessageCallback = null;
     this.onErrorCallback = null;
     this.onExitCallback = null;
+    this.instatiationDirname = Thread.getCallerDirname(1);
+  }
+
+  private static getCallerDirname(skipFrames: number = 1): string {
+    const originalPrepareStackTrace = Error.prepareStackTrace;
+  
+    try {
+      Error.prepareStackTrace = (_: Error, stack: NodeJS.CallSite[]) => stack;
+      const err = new Error();
+      const stack = err.stack as unknown as CallSite[];
+  
+      const targetFrame = 1 + skipFrames;
+  
+      if (stack && stack.length > targetFrame) {
+        const callerFile = stack[targetFrame].getFileName();
+        if (callerFile) {
+          return path.dirname(callerFile);
+        }
+      }
+  
+      return __dirname;
+    } finally {
+      Error.prepareStackTrace = originalPrepareStackTrace;
+    }
   }
 
   private parseSendMessage(message: ThreadMessage<T>): Uint32Array | object {
@@ -44,7 +70,7 @@ export default class Thread<T> {
       return new Uint32Array([this._MESSAGE_TYPE.STRING, ...Buffer.from(message)]);
     } else if (typeof message === 'number') {
       return new Uint32Array([this._MESSAGE_TYPE.NUMBER, message]);
-    } else if (Array.isArray(message) || isTypedArray(message)) {
+    } else if (Array.isArray(message) || message instanceof Uint32Array) {
       return new Uint32Array([this._MESSAGE_TYPE.BYTEARRAY, ...message]);
     } else {
       return message;
@@ -81,20 +107,24 @@ export default class Thread<T> {
       let notify;
       let next;
       let terminate;
+      let importModule;
 
       (function() {
         const { parentPort } = require('worker_threads');
+        const path = require('path');
+        const { pathToFileURL } = require('url');
   
         function _${this.parseSendMessage.toString().replace(/this\._MESSAGE_TYPE/g, JSON.stringify(this._MESSAGE_TYPE))}
         function _${this.parseReceivedMessage.toString().replace(/this\._MESSAGE_TYPE/g, JSON.stringify(this._MESSAGE_TYPE))}
-  
+
         notify = (message) => parentPort.postMessage(_parseSendMessage(message));
         next = () => new Promise((resolve) => parentPort.once('message', (message) => resolve(_parseReceivedMessage(message))));
         terminate = () => parentPort.postMessage('terminate');
+        importModule = (relativePath) => require(path.resolve(${JSON.stringify(this.instatiationDirname)}, relativePath));
       })();
 
       (async function() {
-        const promise = (async function (${functionData.parameters.join(",")}) { ${functionData.body} })(notify, next, terminate);
+        const promise = (async function (${functionData.parameters.join(",")}) { ${functionData.body} })(notify, next, terminate, importModule);
 
         try {
           await promise;

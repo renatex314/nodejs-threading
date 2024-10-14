@@ -56,7 +56,7 @@ export const extractFunctionData = (func: Function): FunctionData => {
 
   return {
     isAsync: isAsync,
-    parameters: params?.split(',').map(p => p.trim()) || [],
+    parameters: params?.split(',').map(p => p.trim()).filter(p => p.length > 0) || [],
     body: body
   };
 

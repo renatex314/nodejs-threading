@@ -27,7 +27,7 @@ export default class ThreadedPromise<E, T> {
       let gotResponse = false;
       const thread = new Thread<T | E>(async (notify, next) => {
          
-        // eslint-disable-next-line no-external-vars/no-external-vars-function
+         
         const params = await next() as JSONCompatible<E>;
         const functionCode = await next() as string;
         let resultError: Error | null = null;
@@ -61,7 +61,7 @@ export default class ThreadedPromise<E, T> {
         }
       });
       thread.start();
-  
+
       thread.notify(params as ThreadMessage<T | E>);
       thread.notify(createThreadFunction());
 
