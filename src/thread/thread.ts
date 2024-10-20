@@ -1,71 +1,113 @@
-import path from "path";
 import { Worker } from "worker_threads";
-import { extractFunctionData, JSONCompatible } from "./utils";
+import { extractFunctionData, getCallerDirname, JSONCompatible, resolveFilenameOnTsNode } from "./utils";
+import ThreadTask from "./thread.task";
 
+export type WorkerFirstMessage = {
+  callerDirname: string;
+  keepAlive: boolean;
+}
+export type WorkerTask = {
+  functionParameters: string;
+  functionBody: string;
+}
 export type ThreadMessage<T> = string | number | Uint32Array | JSONCompatible<T> | object;
+export type NotifyFunction<T> = (message: ThreadMessage<T>) => void;
+export type NextFunction<T> = () => Promise<ThreadMessage<T>>;
+export type TerminateFunction = () => void;
+export type ImportModuleFunction = <T = unknown>(relativePath: string) => Promise<T>;
+
+export type OnExitCallback = () => void;
 
 /**
  * @noExternalVars
 */
 export type ThreadFunction<T> = (
-  notify: (message: ThreadMessage<T>) => void, 
-  next: () => Promise<ThreadMessage<T>>, 
-  terminate: () => void,
-  importModule: <T = unknown>(relativePath: string) => T
+  notify: NotifyFunction<T>, 
+  next: NextFunction<T>, 
+  terminate: TerminateFunction,
+  importModule: ImportModuleFunction
 ) => void;
 
-export type OnMessageCallback<T> = (message: ThreadMessage<T>) => void;
-export type OnErrorCallback = (error: Error) => void;
-export type OnExitCallback = () => void;
-
 export default class Thread<T> {
-  private _MESSAGE_TYPE = {
+  private static _MESSAGE_TYPE = {
     STRING: 0,
     NUMBER: 1,
     BYTEARRAY: 2,
     JSON: 3,
     OTHER: 4
   };
-  private threadFunction: ThreadFunction<T>;
+  private threadTasks: ThreadTask<T>[];
   private runningWorker: Worker | null;
-  private onMessageCallback: OnMessageCallback<T> | null;
-  private onErrorCallback: OnErrorCallback | null;
   private onExitCallback: OnExitCallback | null;
   private instatiationDirname: string;
+  private keepAlive: boolean;
 
-  constructor(fn: ThreadFunction<T>) {
-    this.threadFunction = fn;
+  constructor(fn?: ThreadFunction<T> | null, keepAlive?: boolean) {
+    this.threadTasks = [];
     this.runningWorker = null;
-    this.onMessageCallback = null;
-    this.onErrorCallback = null;
     this.onExitCallback = null;
-    this.instatiationDirname = Thread.getCallerDirname(1);
-  }
+    this.instatiationDirname = getCallerDirname(1);
+    this.keepAlive = keepAlive || false;
 
-  private static getCallerDirname(skipFrames: number = 1): string {
-    const originalPrepareStackTrace = Error.prepareStackTrace;
-  
-    try {
-      Error.prepareStackTrace = (_: Error, stack: NodeJS.CallSite[]) => stack;
-      const err = new Error();
-      const stack = err.stack as unknown as CallSite[];
-  
-      const targetFrame = 1 + skipFrames;
-  
-      if (stack && stack.length > targetFrame) {
-        const callerFile = stack[targetFrame].getFileName();
-        if (callerFile) {
-          return path.dirname(callerFile);
-        }
-      }
-  
-      return __dirname;
-    } finally {
-      Error.prepareStackTrace = originalPrepareStackTrace;
+    if (fn) {
+      this.enqueueTask(fn);
     }
   }
 
-  private parseSendMessage(message: ThreadMessage<T>): Uint32Array | object {
+  enqueueTask<T>(fn: ThreadFunction<T>): ThreadTask<T> {
+    const tasksLength = this.threadTasks.length;
+
+    const task = new ThreadTask<T>({
+      functionParameters: extractFunctionData(fn).parameters.join(","),
+      functionBody: extractFunctionData(fn).body
+    });
+
+    this.threadTasks.push(task);
+
+    if (tasksLength === 0) {
+      this.sendCurrentTaskToWorker();
+    }
+
+    return task;
+  }
+
+  getPendingTasksCount() {
+    return this.threadTasks.length;
+  }
+
+  private sendCurrentTaskToWorker() {
+    if (this.runningWorker && this.threadTasks.length > 0) {
+      const currentTask = this.getCurrentTask();
+
+      if (currentTask.isCancelled()) {
+        currentTask?.onCompletedCallbackFn?.();
+
+        this.threadTasks.shift();
+
+        this.sendCurrentTaskToWorker();
+
+        return;
+      }
+
+      this.runningWorker.postMessage(currentTask.task);
+
+      currentTask._onNotify(() => {
+        const message = currentTask._readNextPendingNotify()!;
+
+        this.runningWorker?.postMessage(Thread.parseSendMessage(message));
+      })
+
+      while (this.getCurrentTask().hasPendingNotify()) {
+        this.runningWorker.postMessage(Thread.parseSendMessage(this.getCurrentTask()._readNextPendingNotify()!));
+      }
+    }
+  }
+
+  private getCurrentTask() {
+    return this.threadTasks[0];
+  }
+
+  static parseSendMessage<T>(message: ThreadMessage<T>): Uint32Array | object {
     if (typeof message === 'string') {
       return new Uint32Array([this._MESSAGE_TYPE.STRING, ...Buffer.from(message)]);
     } else if (typeof message === 'number') {
@@ -77,7 +119,7 @@ export default class Thread<T> {
     }
   }
 
-  private parseReceivedMessage(message: Uint32Array | object): ThreadMessage<T> {
+  static parseReceivedMessage<T>(message: Uint32Array | object): ThreadMessage<T> {
     if (message instanceof Uint32Array) {
       const messageType = message[0];
       const data = message.slice(1);
@@ -100,65 +142,22 @@ export default class Thread<T> {
     return message;
   }
 
-  private createWorkerFunction(): string {
-    const functionData = extractFunctionData(this.threadFunction);
-
-    return `
-      let notify;
-      let next;
-      let terminate;
-      let importModule;
-
-      (function() {
-        const { parentPort } = require('worker_threads');
-        const path = require('path');
-        const { pathToFileURL } = require('url');
-  
-        function _${this.parseSendMessage.toString().replace(/this\._MESSAGE_TYPE/g, JSON.stringify(this._MESSAGE_TYPE))}
-        function _${this.parseReceivedMessage.toString().replace(/this\._MESSAGE_TYPE/g, JSON.stringify(this._MESSAGE_TYPE))}
-
-        notify = (message) => parentPort.postMessage(_parseSendMessage(message));
-        next = () => new Promise((resolve) => parentPort.once('message', (message) => resolve(_parseReceivedMessage(message))));
-        terminate = () => parentPort.postMessage('terminate');
-        importModule = (relativePath) => require(path.resolve(${JSON.stringify(this.instatiationDirname)}, relativePath));
-      })();
-
-      (async function() {
-        const promise = (async function (${functionData.parameters.join(",")}) { ${functionData.body} })(notify, next, terminate, importModule);
-
-        try {
-          await promise;
-        } catch (err) {
-          const { parentPort } = require('worker_threads');
-
-          parentPort.postMessage(err);
-        }
-
-        terminate();
-      })();
-    `;
-  }
-
-  onMessage(callback: OnMessageCallback<T>) {
-    this.onMessageCallback = callback;
-
-    return this;
-  }
-
-  onError(callback: OnErrorCallback) {
-    this.onErrorCallback = callback;
-
-    return this;
-  }
-
   onExit(callback: OnExitCallback) {
     this.onExitCallback = callback;
 
     return this;
   }
 
-  start() {
-    const worker = new Worker(this.createWorkerFunction(), { eval: true });
+  start(): ThreadTask<T> | null {
+    const worker = new Worker(`
+      require('ts-node/register');
+      require(require('worker_threads').workerData.runThisFileInTheWorker);
+    `, {
+      eval: true,
+      workerData: {
+        runThisFileInTheWorker: __dirname + resolveFilenameOnTsNode("/worker.ts")
+      }
+    });
 
     worker.on('message', (message: Uint32Array | string | Error) => {
       if (typeof message === "string") {
@@ -168,35 +167,49 @@ export default class Thread<T> {
           this.runningWorker = null;
         }
 
+        if (message === "completed") {
+          const currentTask = this.getCurrentTask();
+          currentTask?.onCompletedCallbackFn?.();
+
+          this.threadTasks.shift();
+
+          this.sendCurrentTaskToWorker();
+        }
+
         return;
       }
 
+      const currentTask = this.getCurrentTask();
+
       if (typeof message === "object" && message instanceof Error) {
-        this.onErrorCallback?.(message);
+        this.getCurrentTask()?.onErrorCallbackFn?.(message);
         
         return;
       }
 
-      if (this.onMessageCallback) {
-        this.onMessageCallback?.(this.parseReceivedMessage(message));
+      if (currentTask.onErrorCallbackFn) {
+        currentTask.onMessageCallbackFn?.(Thread.parseReceivedMessage(message));
       }
     });
 
     worker.on("exit", () => {
       this.runningWorker = null;
 
+      for (const task of this.threadTasks) {
+        task?.onCompletedCallbackFn?.();
+      }
+
       this.onExitCallback?.();
     });
 
     this.runningWorker = worker;
+    this.runningWorker.postMessage({
+      callerDirname: this.instatiationDirname,
+      keepAlive: this.keepAlive
+    } as WorkerFirstMessage);
+    this.sendCurrentTaskToWorker();
 
-    return this;
-  }
-
-  notify(message: ThreadMessage<T>) {
-    if (this.runningWorker) {
-      this.runningWorker.postMessage(this.parseSendMessage(message));
-    }
+    return this.getCurrentTask();
   }
 
   terminate() {

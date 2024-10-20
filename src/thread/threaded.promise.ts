@@ -1,4 +1,6 @@
-import Thread, { ThreadMessage } from "./thread";
+import Thread, { ThreadFunction, ThreadMessage } from "./thread";
+import ThreadPool from "./thread.pool";
+import ThreadTask from "./thread.task";
 import { extractFunctionData, JSONCompatible } from "./utils";
 
 type PromiseExecutor<T> = (accept: (value: T) => void, reject: (reason: unknown) => void) => void;
@@ -10,13 +12,9 @@ export type ThreadedPromiseExecutor<T, E> = (accept: (value: T) => void, reject:
 
 export default class ThreadedPromise<E, T> {
   private _promise: Promise<ThreadMessage<T>>;
-  private _runningThread: Thread<T | E> | null;
-  private _cancelled: boolean;
+  private currentTask: ThreadTask<T | E> | null = null;
 
-  constructor(executor: ThreadedPromiseExecutor<T, E>, params: ThreadMessage<E> | null = null) {
-    this._runningThread = null;
-    this._cancelled = false;
-
+  constructor(executor: ThreadedPromiseExecutor<T, E>, params: ThreadMessage<E> | null = null, pool?: ThreadPool<T>) {
     const middlewareExecutor: PromiseExecutor<ThreadMessage<T>> = async (accept, reject) => {
       function createThreadFunction(): string {
         const executorData = extractFunctionData(executor);
@@ -24,10 +22,7 @@ export default class ThreadedPromise<E, T> {
         return `(async function (${executorData.parameters.join(",")}) { delete globalThis.notify; delete globalThis.abort; delete globalThis.next; delete globalThis.terminate; delete globalThis.notify; ${executorData.body} })(notify, abort, params)`;
       }
       
-      let gotResponse = false;
-      const thread = new Thread<T | E>(async (notify, next) => {
-         
-         
+      const taskFunction: ThreadFunction<T> = (async (notify, next) => {
         const params = await next() as JSONCompatible<E>;
         const functionCode = await next() as string;
         let resultError: Error | null = null;
@@ -45,35 +40,42 @@ export default class ThreadedPromise<E, T> {
           throw resultError;
         }
       });
-      thread.onMessage((message) => {
+
+      let gotResponse = false;
+      let task;
+
+      if (pool) {
+        task = pool.enqueueTask(taskFunction);
+      } else {
+        task = new Thread(taskFunction).start();
+      }
+
+      task!.onMessage((message) => {
         accept(message as ThreadMessage<T>);
   
         gotResponse = true;
       });
-      thread.onError((error) => {
+      task!.onError((error) => {
         reject(error);
   
         gotResponse = true;
       });
-      thread.onExit(() => {
+      task!.onCompleted(() => {
         if (!gotResponse) {
-          reject(new Error(this._cancelled ? "The task was cancelled" : "Thread exited without any response"));
+          reject(new Error("Task exited without any response"));
         }
       });
-      thread.start();
+      task!.notify(params as ThreadMessage<T | E>);
+      task!.notify(createThreadFunction());
 
-      thread.notify(params as ThreadMessage<T | E>);
-      thread.notify(createThreadFunction());
-
-      this._runningThread = thread;
+      this.currentTask = task;
     }
   
     this._promise = new Promise(middlewareExecutor);
   }
 
-  cancel() {
-    this._cancelled = true;
-    this._runningThread?.terminate();
+  tryCancel() {
+    this.currentTask?.tryCancel();
   }
 
   get then() {

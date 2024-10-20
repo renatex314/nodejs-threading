@@ -1,10 +1,15 @@
+import ThreadPool from "./thread/thread.pool";
 import ThreadedPromise from "./thread/threaded.promise";
 
-const isPrime = async (num: number, cores = 4): Promise<boolean> => new Promise(async (resolve) => {
+const pool = new ThreadPool(7);
+pool.start();
+
+const isPrime = async (num: number, cores = 7, partitions = 7): Promise<boolean> => new Promise(async (resolve) => {
+
   const testNumbers = Array.from({ length: Math.floor(Math.sqrt(num)) }, (_, i) => i + 2);
 
-  const testNumbersChunks = Array.from({ length: cores }, (_, i) => {
-    const chunkSize = Math.ceil(testNumbers.length / cores);
+  const testNumbersChunks = Array.from({ length: partitions }, (_, i) => {
+    const chunkSize = Math.ceil(testNumbers.length / partitions);
 
     return testNumbers.slice(i * chunkSize, (i + 1) * chunkSize);
   }).filter(chunk => chunk.length > 0);
@@ -29,7 +34,7 @@ const isPrime = async (num: number, cores = 4): Promise<boolean> => new Promise(
       }
 
       accept(true);
-    }, param);
+    }, param, pool);
 
     promise
       .then((isPrime) => {
@@ -39,7 +44,7 @@ const isPrime = async (num: number, cores = 4): Promise<boolean> => new Promise(
           resolve(false);
 
           for (const promise of promises) {
-            promise.cancel();
+            promise.tryCancel();
           }
         }
 
@@ -54,31 +59,13 @@ const isPrime = async (num: number, cores = 4): Promise<boolean> => new Promise(
 });
 
 async function main() {
-  // const start = 1E6;
-  // const end = 1E6 + 1000;
-  // const primes: Array<number> = [];
+  const primes = Array.from({ length: 100000 }, (_, i) => i + 1).map((i) => [i, isPrime(i, 1, 1)]);
 
-  // for (let i = start; i <= end; i++) {
-  //   const isAPrimeNumber = await isPrime(i, 10);
-    
-  //   if (isAPrimeNumber) {
-  //     primes.push(i);
-  //   }
+  const results = (await Promise.all(primes.map(async ([_, prom]) => prom))).map((isPrime, i) => isPrime ? i + 1 : -1).filter((i) => i !== -1);
 
-  //   console.log(`${((i - start) / (end - start) * 100).toFixed(1)}%`)
-  // }
+  console.log(results);
 
-  // console.log(primes);
-
-  for (let numCores = 1; numCores <= 15; numCores++) {
-    performance.mark("start");
-    await isPrime(1E16, numCores);
-    performance.mark("end");
-  
-    const duration = performance.measure("isPrime", "start", "end").duration;
-  
-    console.log(`With ${numCores} cores took: ${duration}ms`);
-  }
+  pool.terminate();
 }
 
 main();

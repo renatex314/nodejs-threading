@@ -1,5 +1,7 @@
 /* eslint-disable @typescript-eslint/no-unsafe-function-type */
 
+import path from "path";
+
 export type NotAssignableToJson =
 | bigint
 | symbol
@@ -15,6 +17,42 @@ export type JSONCompatible<T> = unknown extends T ? never : {
     T[P] extends NotAssignableToJson ? never :
       JSONCompatible<T[P]>;
 };
+
+export const getCallerDirname = (skipFrames: number = 1): string => {
+  const originalPrepareStackTrace = Error.prepareStackTrace;
+
+  try {
+    Error.prepareStackTrace = (_: Error, stack: NodeJS.CallSite[]) => stack;
+    const err = new Error();
+    const stack = err.stack as unknown as NodeJS.CallSite[];
+
+    const targetFrame = 1 + skipFrames;
+
+    if (stack && stack.length > targetFrame) {
+      const callerFile = stack[targetFrame].getFileName();
+      if (callerFile) {
+        return path.dirname(callerFile);
+      }
+    }
+
+    return __dirname;
+  } finally {
+    Error.prepareStackTrace = originalPrepareStackTrace;
+  }
+}
+
+export const isRunningOnTsNode = () => {
+  // @ts-expect-error // check if code is not running under ts-node
+  return !!process[Symbol.for("ts-node.register.instance")];
+}
+
+export const resolveFilenameOnTsNode = (filename: string) => {
+  if (!isRunningOnTsNode()) {
+    return filename.replace('.ts','.js');
+  }
+    
+  return filename;
+}
 
 export type FunctionData = { isAsync: boolean, parameters: Array<string>, body: string };
 export const extractFunctionData = (func: Function): FunctionData => {
